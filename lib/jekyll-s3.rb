@@ -1,6 +1,7 @@
 require 'rubygems'
 require 'yaml'
 require 'aws/s3'
+require 'digest/md5'
 
 module Jekyll
   module S3

@@ -33,69 +33,123 @@ s3_bucket: your.blog.bucket.com
         end
       end
       
-      def local_files
-        Dir[SITE_DIR + '/**/*'].
-          delete_if { |f| File.directory?(f) }.
-          map { |f| f.gsub(SITE_DIR + '/', '') }
-      end
-
-      # Please spec me!
-      def upload_to_s3!
-        puts "Deploying _site/* to #{@s3_bucket}"
-
+      def bucket
+        return @bucket if @bucket
+        
         AWS::S3::Base.establish_connection!(
             :access_key_id     => @s3_id,
             :secret_access_key => @s3_secret,
             :use_ssl => true
         )
-        unless AWS::S3::Service.buckets.map(&:name).include?(@s3_bucket)
-          puts("Creating bucket #{@s3_bucket}")
-          AWS::S3::Bucket.create(@s3_bucket)
+        unless AWS::S3::Service.buckets.map(&:name).include?(@s3_bucket_name)
+          puts("Creating bucket #{@s3_bucket_name}")
+          AWS::S3::Bucket.create(@s3_bucket_name)
         end
 
-        bucket = AWS::S3::Bucket.find(@s3_bucket)
+        @bucket ||= AWS::S3::Bucket.find(@s3_bucket_name)
+      end
+      
+      def upload(local_file)
+        run_with_retry do
+          AWS::S3::S3Object.store(local_file, open("#{SITE_DIR}/#{local_file}"), @s3_bucket_name, :access => 'public-read')
+        end
+      end
+      
+      def delete(local_file)
+        run_with_retry do
+          AWS::S3::S3Object.delete(local_file, @s3_bucket_name)
+        end
+      end
+      
+      def local_files
+        # Hash. Key is filename, value is md5 sum (which should match etags)
+        return @local_files if @local_files
+        
+        @local_files ||= {}
+        Dir[SITE_DIR + '/**/*'].
+          delete_if { |f| File.directory?(f) }.
+          map { |f| f.gsub(SITE_DIR + '/', '') }.
+          each do  |local_file|
+            @local_files[local_file] = Digest::MD5.file(local_file).to_s()
+          end
+        @local_files
+      end
+      
+      def remote_files
+        # Hash. Key is filename, value is etag
+        return @remote_files if @remote_files
+        
+        @remote_files ||= {}
+        bucket.objects.each do |remote_file|
+          @remote_files[remote_file.key] = remote_file.about['etag'].gsub('"', '')
+        end
+        @remote_files
+      end
+      
+      def new_local_files
+        # Array of file names
+        local_files.keys - remote_files.keys
+      end
+      
+      def deleted_local_files
+        # Array of file names
+        remote_files.keys - local_files.keys
+      end
+      
+      def changed_local_files
+        # Array of file names
+        (local_files.keys & remote_files.keys).delete_if { |filename| local_files[filename] == remote_files[filename] }
+      end
+      
+      def prompt_to_delete(file)
+        @delete_all ||= false
+        @keep_all ||= false
+        delete = false
+        keep = false
+        until delete || @delete_all || keep || @keep_all
+          puts "#{local_file} is on S3 but not in your _site directory anymore. Do you want to [d]elete, [D]elete all, [k]eep, [K]eep all?"
+          case STDIN.gets.chomp
+          when 'd' then delete = true
+          when 'D' then @delete_all = true
+          when 'k' then keep = true
+          when 'K' then @keep_all = true
+          end
+        end
+        
+        (@delete_all || delete) && !(@keep_all || keep)
+      end
 
-        remote_files = bucket.objects.map { |f| f.key }
+      # Please spec me!
+      def upload_to_s3!
+        puts "Deploying _site/* to #{@s3_bucket_name}"
 
-        to_upload = local_files
-        to_upload.each do |f|
-          run_with_retry do
-            if AWS::S3::S3Object.store(f, open("#{SITE_DIR}/#{f}"), @s3_bucket, :access => 'public-read')
-              puts("Upload #{f}: Success!")
+        new_local_files.each do |local_file|
+          if upload(local_file)
+            puts("Upload New #{local_file}: Success!")
+          else
+            puts("Upload New #{local_file}: FAILURE!")
+          end
+        end
+        
+        changed_local_files.each do |local_file|
+          if upload(local_file)
+            puts("Upload Changed #{local_file}: Success!")
+          else
+            puts("Upload Changed #{local_file}: FAILURE!")
+          end
+        end
+        
+        deleted_local_files.each do |local_file|
+          if prompt_to_delete(local_file)
+            if delete(local_file)
+              puts("Delete #{local_file}: Success!")
             else
-              puts("Upload #{f}: FAILURE!")
+              puts("Delete #{local_file}: FAILURE!")
             end
           end
         end
 
-        to_delete = remote_files - local_files
-
-        delete_all = false
-        keep_all = false
-        to_delete.each do |f| 
-          delete = false
-          keep = false
-          until delete || delete_all || keep || keep_all
-            puts "#{f} is on S3 but not in your _site directory anymore. Do you want to [d]elete, [D]elete all, [k]eep, [K]eep all?"
-            case STDIN.gets.chomp
-            when 'd' then delete = true
-            when 'D' then delete_all = true
-            when 'k' then keep = true
-            when 'K' then keep_all = true
-            end
-          end
-          if (delete_all || delete) && !(keep_all || keep)
-            run_with_retry do
-              if AWS::S3::S3Object.delete(f, @s3_bucket)
-                puts("Delete #{f}: Success!")
-              else
-                puts("Delete #{f}: FAILURE!")
-              end
-            end
-          end
-        end
-
-        puts "Done! Go visit: http://#{@s3_bucket}.s3.amazonaws.com/index.html"
+        puts "Done! Go visit: http://#{@s3_bucket_name}.s3.amazonaws.com/index.html"
         true
       end
 
@@ -122,9 +176,9 @@ s3_bucket: your.blog.bucket.com
 
         @s3_id = config['s3_id']
         @s3_secret = config['s3_secret']
-        @s3_bucket = config['s3_bucket']
+        @s3_bucket_name = config['s3_bucket']
 
-        [@s3_id, @s3_secret, @s3_bucket].select { |k| k.nil? || k == '' }.empty?
+        [@s3_id, @s3_secret, @s3_bucket_name].select { |k| k.nil? || k == '' }.empty?
       end
 
       def create_template_configuration_file
